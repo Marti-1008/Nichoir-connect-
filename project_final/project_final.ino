@@ -1,9 +1,12 @@
-#include <WiFi.h> 
+#include "M5TimerCAM.h"
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include "Base64.h"  // bibliothèque ArduinoBase64
 #include <NetworkClient.h> 
 #include <WebServer.h> 
 #include <ESPmDNS.h> 
 #include <EEPROM.h>
-#include "driver/rtc_io.h"
+#include <driver/gpio.h>
 
 
 #define batterie_ADC 33
@@ -21,18 +24,23 @@
 
 
 
-
+bool condition1 ;
+bool condition2 ;
+bool flag_WIFI ; 
+bool condition_mqtt;
+bool condition_final;
 const char* ssid = "esp32_test"; 
 const char* password = "12345678"; 
 
 
 byte b1, b2;
 
-IPAddress server(192,168,2,45);
-
 WiFiClient espClient;
 PubSubClient client(espClient);
-WebServer server(80); 
+IPAddress mqttServer(192,168,2,45); // Pour MQTT
+WebServer server(80);               // Pour serveur web
+
+
 
 void change_wifi() 
 { 
@@ -77,13 +85,13 @@ void handleSaveWifi()
   char pass_received [PASS_MAX_LEN]; 
   String ssidStr = server.arg("ssid");
   ssidStr.toCharArray(ssid_received, SSID_MAX_LEN);
-  String pwStr = server.arg("pw");
-  pwdStr.toCharArray(ssid_received, SSID_MAX_LEN);
+  String pwdStr = server.arg("pw");
+  pwdStr.toCharArray(pass_received, PASS_MAX_LEN);
   Serial.println("Reçu SSID : " + ssidStr); 
-  Serial.println("Reçu Password : " + pwStr); 
+  Serial.println("Reçu Password : " + pwdStr); 
   server.sendHeader("Location", "/");
   server.send(303); // 303 = See Other
-  EEPROM.put(adresse_wifi, ssid_received));
+  EEPROM.put(adresse_wifi, ssid_received);
   EEPROM.put(adresse_pw, pass_received);
   EEPROM.commit();
 } 
@@ -92,23 +100,27 @@ void setup()
 { 
   pinMode(LED_PIN, OUTPUT);
   pinMode(CAPTEUR_PIN, INPUT);
-  rtc_gpio_pullup_dis((gpio_num_t)CAPTEUR_PIN);
+  gpio_pulldown_en((gpio_num_t)CAPTEUR_PIN);
+  gpio_pullup_dis((gpio_num_t)CAPTEUR_PIN);
   // EXT1 wakeup : se réveille si le capteur est HIGH
   esp_sleep_enable_ext1_wakeup((1ULL << CAPTEUR_PIN), ESP_EXT1_WAKEUP_ANY_HIGH);
 
   // Timer wakeup : se réveille toutes les 24h
   esp_sleep_enable_timer_wakeup(24ULL * 60 * 60 * 1000000ULL); // 24h en microsecondes
   Serial.begin(115200); 
-  bool condition1 = EEPROM.get(ADDR_MAGIC, b1) != MAGIC_VALUE1;
-  bool condition2 = MAGIC_VALUE2 != EEPROM.get(ADDR_MAGIC+1, b2);
+  EEPROM.get(ADDR_MAGIC, b1);
+   EEPROM.get(ADDR_MAGIC+1, b2);
+  condition1 =  b1!= MAGIC_VALUE1;
+  condition2 = MAGIC_VALUE2 != b2;
   int flag_wifi;
   EEPROM.get(Adress_missed_connexion, flag_wifi);
-  bool flag_WIFI = (flag_wifi >= 2);
+  flag_WIFI = (flag_wifi >= 2);
 
   
   int flag_mqtt;
-  bool condition_mqtt = (EEPROM.get(adresse_mqtt,flag_mqtt)==1);
-  bool condition_final =  (condition1 && condition2)  || flag_WIFI || condition_mqttt; // rajouter déconnexion et mqt
+  EEPROM.get(adresse_mqtt,flag_mqtt);
+  condition_mqtt = flag_mqtt==1;
+  condition_final =  (condition1 && condition2)  || flag_WIFI || condition_mqtt; // rajouter déconnexion et mqt
 
 
   WiFi.mode(condition_final ? WIFI_MODE_AP : WIFI_STA ); // en fonction de si c'est le premier passage ou non définit le mode
@@ -147,15 +159,18 @@ void setup()
     Serial.println("");
     Serial.print("Connecting to ");
     Serial.println(ssid);
-    // Wait for connection
-    while (WiFi.status() != WL_CONNECTED)
+
+    while (!WiFi.status() )
     {
       delay(500);
       Serial.print(".");
     }
     int valeur_missed_connexion ;
+    client.setServer(mqttServer, 1883);
+    client.setServer(mqttServer, 1883);
+
     EEPROM.get(Adress_missed_connexion,valeur_missed_connexion);
-    if (valeur_missed_connexion !=0)
+    if (valeur_missed_connexion !=0 && WiFi.status())
     {
       EEPROM.put(Adress_missed_connexion, 0);
       EEPROM.commit();
@@ -166,10 +181,11 @@ void setup()
     Serial.println(ssid);
     Serial.print("IP address: ");
     Serial.println(WiFi.localIP());
-    client.setServer(server,1883);
     String esp32 = "ESP32Client-";
     esp32 += String(random(0xffff), HEX);
     client.connect(esp32.c_str());
+    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+
     if (cause == ESP_SLEEP_WAKEUP_EXT1)
     {
       TimerCAM.begin();
@@ -185,14 +201,11 @@ void setup()
 
  void loop() 
 { 
-  int flag_mqtt;
-  bool deconnexion = EEPROM.get(adresse_mqtt, flag_mqtt)==1;
-  if (WiFi.status() != WL_CONNECTED || deconnexion)
+
+  if (WiFi.status() != WL_CONNECTED || condition_mqtt)
   {
-  bool condition1 = EEPROM.get(ADDR_MAGIC, b1) != MAGIC_VALUE1;
-  bool condition2 = MAGIC_VALUE2 != EEPROM.get(ADDR_MAGIC+1, b2);
-  bool condition_final =  condition1 && condition2; // rajouter déconnexion et mqtt
-    if (condution_final)//lors du premier passage utilisation du site web
+    condition_final =  (condition1 && condition2)  || flag_WIFI || condition_mqtt;
+    if (condition_final)//lors du premier passage utilisation du site web
     {
       EEPROM.put(ADDR_MAGIC,MAGIC_VALUE1);
       EEPROM.put(ADDR_MAGIC+1,MAGIC_VALUE2);
@@ -221,6 +234,7 @@ void setup()
     // take a photoif (TimerCAM.Camera.get()) 
     if (TimerCAM.Camera.get()) 
     {
+      digitalWrite(LED_PIN, LOW);
       uint8_t* img = TimerCAM.Camera.fb->buf;
       size_t size = TimerCAM.Camera.fb->len;
 
@@ -236,8 +250,12 @@ void setup()
 
       client.publish("esp32/MineurBenNanna/image", "start"); // début
           
-      int taille = imgBase64.length()
-      client.publish("esp32/MineurBenNanna/nbrpaquet",taille/maxChunk)
+      int taille = imgBase64.length();
+      int nbr_paquet = taille / maxChunk;
+      String nbr_paquet_str = String(nbr_paquet);
+      client.publish("esp32/MineurBenNanna/nbrpaquet", nbr_paquet_str.c_str());
+
+      
       while (offset < taille) 
       {
             
@@ -251,14 +269,15 @@ void setup()
       TimerCAM.Camera.free();
       delay(60000); // attente avant prochaine capture
     } 
+    digitalWrite(LED_PIN, LOW);
   }
   else if (cause == ESP_SLEEP_WAKEUP_TIMER)
   {
     // envoie le niveau de la batterie
-    char tension = '0' + TimerCAM.Power.getBatteryVoltage();
-    char level = '0'+ TimerCAM.Power.getBatteryLevel()
-    client.publish("esp32/MineurBenNanna/batterie/level",level);
-    client.publish("esp32/MineurBenNanna/batterie/tension", tension);
+    String tensionStr = String(TimerCAM.Power.getBatteryVoltage());
+    String levelStr = String(TimerCAM.Power.getBatteryLevel());
+    client.publish("topic", tensionStr.c_str());
+    client.publish("esp32/MineurBenNanna/batterie/level",levelStr.c_str());
 
   }
   esp_deep_sleep_start();
